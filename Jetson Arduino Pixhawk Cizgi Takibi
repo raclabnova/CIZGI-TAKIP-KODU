@@ -1,0 +1,234 @@
+Bu kodda arduino varkenki çizgi takip kodu
+DİKKAT!!!!!!
+EĞERKİ GÜÇ YENİ VERİLDİYSE PİXHAWK İÇİN KODA 15SN BEKLEME SÜRESİ EKLENMELİ
+
+python3 cizgi.py diye kodu kaydedip çalıştırılabilir yapıp terminalde başlat. Belli bir süre kamera açılmasını bekle.
+
+
+
+*****JETSONDAKİ TERMİNALDE ÇALIŞTIRILACAK KOD********
+
+import cv2
+import numpy as np
+import time
+import serial
+
+def capture_frame(cap):
+    ret, frame = cap.read()
+    if not ret:
+        raise ValueError("Kameradan görüntü alınamadı!")
+    return frame
+
+def detect_black_area(frame):
+    hsv_image = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_black = np.array([0, 0, 0])
+    upper_black = np.array([180, 255, 70])
+
+    black_mask = cv2.inRange(hsv_image, lower_black, upper_black)
+    blurred_mask = cv2.GaussianBlur(black_mask, (9, 9), 0)
+    kernel = np.ones((7, 7), np.uint8)
+    cleaned_mask = cv2.morphologyEx(blurred_mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    black_cx, black_cy = 0, 0
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) > 100:
+            M = cv2.moments(largest)
+            if M['m00'] != 0:
+                black_cx = int(M['m10'] / M['m00'])
+                black_cy = int(M['m01'] / M['m00'])
+                cv2.circle(frame, (black_cx, black_cy), 5, (0, 255, 0), -1)
+    return black_cx, black_cy, frame
+
+def komut_gonder(ser, komut):
+    ser.write((komut + '\n').encode())
+    print(f"📤 Gönderildi: {komut}")
+    time.sleep(1)
+
+def calculate_direction(black_cx, black_cy, frame_center_x, frame_center_y, ser, last_direction):
+    if black_cx < frame_center_x - 70:
+        if last_direction != "sol":
+            komut_gonder(ser, "sol")
+            #komut_gonder(ser, "stop")
+        return "sol"
+    elif black_cx > frame_center_x + 70:
+        if last_direction != "sag":
+            komut_gonder(ser, "sag")
+            #komut_gonder(ser, "stop")
+        return "sag"
+    else:
+        if last_direction != "ileri":
+            komut_gonder(ser, "ileri")
+            #komut_gonder(ser, "stop")
+        return "ileri"
+
+def process_frame(frame, ser, last_direction):
+    center_x = frame.shape[1] // 2
+    center_y = frame.shape[0] // 2
+    black_cx, black_cy, frame = detect_black_area(frame)
+    direction = calculate_direction(black_cx, black_cy, center_x, center_y, ser, last_direction)
+    return frame, direction
+
+def main():
+    try:
+        ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+        time.sleep(2)
+
+        komut_gonder(ser, "arm")
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Kamera açılamadı.")
+            return
+
+        print("Çıkmak için 'q' tuşuna basın...")
+
+        last_direction = ""
+
+        while True:
+            start_time = time.time()
+            frame = capture_frame(cap)
+            frame, direction = process_frame(frame, ser, last_direction)
+            last_direction = direction
+
+            # FPS ve yön
+            fps = 1.0 / (time.time() - start_time)
+            cv2.putText(frame, f"FPS: {fps:.2f}", (40, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(frame, direction, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imshow("Frame", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                komut_gonder(ser, "stop")
+                break
+
+    except Exception as e:
+        print(f"⚠️ Hata: {e}")
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
+
+if __name__ == "__main__":
+    main()
+
+
+
+*****ARDUİNODAKİ YÜKLENECEK KOD******
+
+#include <MAVLink.h>
+
+#define SYSID 255
+#define COMPID MAV_COMP_ID_SYSTEM_CONTROL
+
+String komut = "";
+
+void setup() {
+  Serial.begin(115200);     // Jetson ile iletişim
+  Serial1.begin(57600);     // Pixhawk ile iletişim (TX:18, RX:19)
+  delay(3000);              // Pixhawk hazır olsun
+}
+
+void send_pwm_command(uint8_t kanal, uint16_t pwm) {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  mavlink_msg_command_long_pack(
+    SYSID, COMPID, &msg,
+    1, 1,
+    MAV_CMD_DO_SET_SERVO,
+    0,
+    kanal, pwm,
+    0, 0, 0, 0, 0
+  );
+
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  Serial1.write(buf, len);
+}
+
+void arm_motors() {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  mavlink_msg_command_long_pack(
+    SYSID, COMPID, &msg,
+    1, 1,
+    MAV_CMD_COMPONENT_ARM_DISARM,
+    0,
+    1, 0, 0, 0, 0, 0, 0
+  );
+
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  Serial1.write(buf, len);
+}
+
+void stop_motors() {
+  for (int i = 1; i <= 6; i++) {
+    send_pwm_command(i, 1500);
+  }
+}
+
+void loop() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      komut.trim();
+
+      if (komut == "arm") {
+        arm_motors();
+      }
+
+      else if (komut == "ileri") {
+        send_pwm_command(1, 1700);
+        send_pwm_command(2, 1700);
+        send_pwm_command(3, 1700);
+        send_pwm_command(4, 1700);
+      }
+
+      else if (komut == "geri") {
+        send_pwm_command(1, 1300);
+        send_pwm_command(2, 1300);
+        send_pwm_command(3, 1300);
+        send_pwm_command(4, 1300);
+      }
+
+      else if (komut == "sol") {
+        send_pwm_command(2, 1700);  // sol ön
+        send_pwm_command(4, 1700);  // sol arka
+        send_pwm_command(1, 1300);  // sağ ön
+        send_pwm_command(3, 1300);  // sağ arka
+      }
+
+      else if (komut == "sag") {
+        send_pwm_command(1, 1700);  // sağ ön
+        send_pwm_command(3, 1700);  // sağ arka
+        send_pwm_command(2, 1300);  // sol ön
+        send_pwm_command(4, 1300);  // sol arka
+      }
+
+      else if (komut == "yukari") {
+        send_pwm_command(5, 1700);
+        send_pwm_command(6, 1700);
+      }
+
+      else if (komut == "asagi") {
+        send_pwm_command(5, 1300);
+        send_pwm_command(6, 1300);
+      }
+
+      else if (komut == "stop") {
+        stop_motors();
+      }
+
+      komut = "";
+    } else {
+      komut += c;
+    }
+  }
+}
+
+
+
