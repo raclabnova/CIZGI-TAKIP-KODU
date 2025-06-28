@@ -1,0 +1,158 @@
+
+
+
+
+*****SADECE JETSON VAR ARDUİNO YOK*****
+
+
+import cv2
+import numpy as np
+import time
+from pymavlink import mavutil
+
+#time.sleep(15)
+
+
+# --- Pixhawk bağlantısı kur ---
+def baglanti_kur(port="/dev/ttyACM0", baud=57600):
+    master = mavutil.mavlink_connection(port, baud=baud)
+    print("📡 Pixhawk bağlantısı bekleniyor...")
+    master.wait_heartbeat()
+    print("✅ Pixhawk bağlantısı kuruldu.")
+    return master
+
+# --- PWM komutu gönder ---
+def pwm_gonder(master, kanal, pwm_deger):
+    pwm_deger = max(min(pwm_deger, 1900), 1100)  # PWM sınırlandırması
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+        0,
+        kanal,
+        pwm_deger,
+        0, 0, 0, 0, 0
+    )
+    print(f"📤 Kanal {kanal} → PWM {pwm_deger}")
+
+# --- Motorları durdur ---
+def stop_motors(master):
+    for i in range(1, 7):
+        pwm_gonder(master, i, 1500)  # 1500 genellikle nötr (stop)
+
+# --- ARM komutu gönder ---
+def arm_motors(master):
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        1, 0, 0, 0, 0, 0, 0
+    )
+    print("✅ Motorlar ARM edildi.")
+
+# --- Siyah alanı algıla ---
+def detect_black_area(frame):
+    hsv_image = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_black = np.array([0, 0, 0])
+    upper_black = np.array([180, 255, 70])
+    mask = cv2.inRange(hsv_image, lower_black, upper_black)
+    blurred_mask = cv2.GaussianBlur(mask, (9, 9), 0)
+    kernel = np.ones((7, 7), np.uint8)
+    cleaned_mask = cv2.morphologyEx(blurred_mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    black_cx, black_cy = 0, 0
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) > 100:
+            M = cv2.moments(largest)
+            if M['m00'] != 0:
+                black_cx = int(M['m10'] / M['m00'])
+                black_cy = int(M['m01'] / M['m00'])
+                cv2.circle(frame, (black_cx, black_cy), 7, (0, 255, 0), -1)
+    return black_cx, black_cy, frame
+
+# --- Yön hesapla ve PWM gönder ---
+def calculate_direction(black_cx, frame_center_x, master, last_direction):
+    # Sensörün merkeze göre pozisyonuna göre PWM gönderiyoruz
+    if black_cx < frame_center_x - 70:
+        if last_direction != "sol":
+            print("🔄 Sol dönüş")
+            pwm_gonder(master, 2, 1700)  # sol ön
+            pwm_gonder(master, 4, 1700)  # sol arka
+            pwm_gonder(master, 1, 1300)  # sağ ön
+            pwm_gonder(master, 3, 1300)  # sağ arka
+        return "sol"
+
+    elif black_cx > frame_center_x + 70:
+        if last_direction != "sag":
+            print("🔄 Sağ dönüş")
+            pwm_gonder(master, 1, 1700)  # sağ ön
+            pwm_gonder(master, 3, 1700)  # sağ arka
+            pwm_gonder(master, 2, 1300)  # sol ön
+            pwm_gonder(master, 4, 1300)  # sol arka
+        return "sag"
+
+    else:
+        if last_direction != "ileri":
+            print("🔄 İleri")
+            pwm_gonder(master, 1, 1700)
+            pwm_gonder(master, 2, 1700)
+            pwm_gonder(master, 3, 1700)
+            pwm_gonder(master, 4, 1700)
+        return "ileri"
+
+# --- Frame işle ---
+def process_frame(frame, master, last_direction):
+    center_x = frame.shape[1] // 2
+    black_cx, _, frame = detect_black_area(frame)
+    direction = calculate_direction(black_cx, center_x, master, last_direction)
+    return frame, direction
+
+# --- Ana fonksiyon ---
+def main():
+    try:
+        master = baglanti_kur()
+        arm_motors(master)
+        time.sleep(2)  # ARM sonrası bekle
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Kamera açılamadı.")
+            return
+
+        last_direction = ""
+
+        while True:
+            start_time = time.time()
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            frame, direction = process_frame(frame, master, last_direction)
+            last_direction = direction
+
+            fps = 1.0 / (time.time() - start_time)
+            cv2.putText(frame, f"FPS: {fps:.2f}", (40, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(frame, direction, (40, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            cv2.imshow("Jetson-Pixhawk PWM Kontrol", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("🚦 Stop komutu gönderiliyor...")
+                stop_motors(master)
+                break
+
+    except Exception as e:
+        print(f"⚠️ Hata: {e}")
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
